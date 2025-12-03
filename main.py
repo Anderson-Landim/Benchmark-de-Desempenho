@@ -34,6 +34,7 @@ class FormatPanel(ttk.LabelFrame):
         self._build_ui()
 
     def _build_ui(self):
+
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=X, pady=(0,6))
 
@@ -46,6 +47,12 @@ class FormatPanel(ttk.LabelFrame):
         # Log area
         self.log = tk.Text(self, height=6, bg="#101010", fg="#a8ffb0", wrap='word')
         self.log.pack(fill=X, pady=6)
+        # Loading spinner (fica oculto até carregar)
+        self.spinner = ttk.Progressbar(self, mode="indeterminate", bootstyle=INFO)
+        self.spinner.pack(fill=X, pady=4)
+        self.spinner.stop()
+        self.spinner.place_forget()
+
 
         # Search
         search_frame = ttk.Frame(self)
@@ -93,7 +100,13 @@ class FormatPanel(ttk.LabelFrame):
         if not self.selected_file:
             messagebox.showwarning('Aviso', 'Selecione um arquivo antes de carregar.')
             return
+
+        # Mostrar spinner
+        self.spinner.place(relx=0.02, rely=0.42, relwidth=0.96)
+        self.spinner.start(10)
+
         threading.Thread(target=self._load_worker, daemon=True).start()
+
 
     def _load_worker(self):
         path = self.selected_file
@@ -112,14 +125,19 @@ class FormatPanel(ttk.LabelFrame):
                 else:
                     df = pd.json_normalize(data)
             elif self.fmt_key == 'toon':
-                try:
-                    import toon
-                except Exception:
-                    self._append_log('ERRO: pacote TOON não encontrado. Instale `pip install toon_format`')
-                    return
                 with open(path, 'r', encoding='utf-8') as f:
-                    parsed = toon.load(f.read())
-                df = pd.DataFrame(parsed)
+                    linhas = f.readlines()
+
+                # Determina número de colunas pela primeira linha
+                colunas = ['col_' + str(i+1) for i in range(len(linhas[0].split('|')))]
+
+                parsed = []
+                for linha in linhas:
+                    partes = linha.strip().split('|')
+                    parsed.append(partes)
+
+                df = pd.DataFrame(parsed, columns=colunas)
+
             else:
                 raise RuntimeError('Formato não suportado')
 
@@ -127,6 +145,9 @@ class FormatPanel(ttk.LabelFrame):
             self._append_log(f'ERRO ao carregar: {e}')
             self.df = None
             self.comparator.record(self.fmt_key, path, None, None)
+            self.spinner.stop()
+            self.spinner.place_forget()
+
             return
 
         t1 = time.perf_counter()
@@ -137,6 +158,9 @@ class FormatPanel(ttk.LabelFrame):
         self.info_var.set(f'Arquivo: {os.path.basename(path)} | {rows} linhas')
         self._fill_table()
         self.comparator.record(self.fmt_key, path, elapsed, rows)
+        # parar spinner quando terminar
+        self.spinner.stop()
+        self.spinner.place_forget()
 
     def _load_sqlite(self, path):
         conn = sqlite3.connect(path)
@@ -173,22 +197,25 @@ class FormatPanel(ttk.LabelFrame):
         return chosen.get()
 
     def _fill_table(self):
-        # clear
+        # limpar colunas e linhas atuais
         for c in self.table['columns']:
             self.table.heading(c, text='')
         self.table.delete(*self.table.get_children())
 
         cols = list(map(str, self.df.columns))
         self.table['columns'] = cols
-        for c in cols:
-            self.table.heading(c, text=c)
-            self.table.column(c, width=120)
 
-        # insert at most first N rows (to avoid UI freezing)
+        # configurar colunas centralizadas
+        for c in cols:
+            self.table.heading(c, text=c, anchor=CENTER)
+            self.table.column(c, width=140, anchor=CENTER)
+
+        # Inserir linhas (limitado para não travar a UI)
         maxrows = min(len(self.df), 1000)
         for idx in range(maxrows):
             vals = [self._shortify(v) for v in self.df.iloc[idx].tolist()]
             self.table.insert('', 'end', values=vals)
+
 
     def _shortify(self, v):
         s = '' if pd.isna(v) else str(v)
@@ -229,15 +256,31 @@ class FormatPanel(ttk.LabelFrame):
 class ComparatorPanel(ttk.LabelFrame):
     def __init__(self, master, *args, **kwargs):
         super().__init__(master, text='Comparação', padding=8, *args, **kwargs)
-        self.records = {}  # fmt_key -> (file, time, rows)
+        self.records = {}  # fmt -> (file, time, rows)
         self._build_ui()
 
     def _build_ui(self):
-        cols = ('format', 'file', 'time_s', 'rows')
+        cols = ('format', 'file', 'time_s', 'rows', 'size', 'speed', 'rank')
         self.table = ttk.Treeview(self, columns=cols, show='headings', height=6)
+
+        headers = {
+            'format': 'Formato',
+            'file': 'Arquivo',
+            'time_s': 'Tempo (s)',
+            'rows': 'Linhas',
+            'size': 'Tamanho',
+            'speed': 'Linhas/s',
+            'rank': 'Ranking'
+        }
+
         for c in cols:
-            self.table.heading(c, text=c)
-            self.table.column(c, width=140)
+            self.table.heading(c, text=headers[c], anchor=CENTER)
+            self.table.column(c, width=140, anchor=CENTER)
+
+        # cores suaves para destaque
+        self.table.tag_configure("fastest", background="#d4fcd4")   # verde pastel
+        self.table.tag_configure("slowest", background="#fcd4d4")   # vermelho suave
+
         self.table.pack(fill=BOTH, expand=True)
 
     def record(self, fmt_key, file, time_s, rows):
@@ -246,15 +289,56 @@ class ComparatorPanel(ttk.LabelFrame):
 
     def _refresh(self):
         self.table.delete(*self.table.get_children())
+
+        valid_times = [(fmt, rec[0], rec[1], rec[2]) 
+                       for fmt, rec in self.records.items() if rec[1] is not None]
+
+        if not valid_times:
+            return
+
+        fastest = min(valid_times, key=lambda x: x[2])
+        slowest = max(valid_times, key=lambda x: x[2])
+        ordered = sorted(valid_times, key=lambda x: x[2])
+        ranking = {fmt: i + 1 for i, (fmt, *_rest) in enumerate(ordered)}
+
         for fmt in ('sqlite', 'csv', 'json', 'toon'):
             rec = self.records.get(fmt)
-            if rec:
-                file, t, rows = rec
-                tstr = '' if t is None else f'{t}'
-                rstr = '' if rows is None else f'{rows}'
-                self.table.insert('', 'end', values=(fmt, os.path.basename(file) if file else '', tstr, rstr))
+            if not rec:
+                self.table.insert('', 'end', values=(fmt, '', '', '', '', '', ''))
+                continue
+
+            file, t, rows = rec
+            filename = os.path.basename(file) if file else ''
+
+            # tamanho do arquivo
+            if file:
+                size_bytes = os.path.getsize(file)
+                size_str = (
+                    f"{size_bytes/1024:.1f} KB"
+                    if size_bytes < 1_000_000 else
+                    f"{size_bytes/1024/1024:.2f} MB"
+                )
             else:
-                self.table.insert('', 'end', values=(fmt, '', '', ''))
+                size_str = ''
+
+            # velocidade (linhas/seg)
+            speed = ''
+            if t and rows:
+                speed = f"{int(rows / t):,}".replace(",", ".")
+
+            # ranking
+            rnk = ranking.get(fmt, '')
+
+            row = (fmt, filename, t, rows, size_str, speed, rnk)
+
+            # destaque suave
+            tag = ''
+            if fmt == fastest[0]:
+                tag = 'fastest'
+            elif fmt == slowest[0]:
+                tag = 'slowest'
+
+            self.table.insert('', 'end', values=row, tags=(tag,))
 
 
 class App(tb.Window):
@@ -284,9 +368,39 @@ class App(tb.Window):
 
         # bottom comparison
         self.comparator.pack(fill=X, pady=8)
+        ttk.Button(main, text="Limpar Tudo", bootstyle=DANGER, command=self.limpar_tudo)\
+            .pack(fill=X, pady=(10,5))
 
     def run(self):
         self.mainloop()
+    def limpar_tudo(self):
+        # limpar comparador
+        self.comparator.records = {}
+        self.comparator._refresh()
+
+        # limpar cada painel
+        for panel in self.panels.values():
+            panel.selected_file = None
+            panel.df = None
+
+            # limpar info
+            panel.info_var.set("Nenhum arquivo")
+
+            # limpar log
+            panel.log.delete("1.0", "end")
+
+            # limpar tabela
+            panel.table.delete(*panel.table.get_children())
+            panel.table['columns'] = []
+
+            # parar spinner se estiver ativo
+            try:
+                panel.spinner.stop()
+                panel.spinner.place_forget()
+            except:
+                pass
+
+        messagebox.showinfo("Limpo", "Todos os dados foram apagados.")
 
 
 if __name__ == '__main__':

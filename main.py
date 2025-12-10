@@ -8,20 +8,12 @@ import os
 import json
 import sqlite3
 import pandas as pd
+import psutil, os
 
-"""
-Multi-column Data Loader and Comparator
-Layout: 4 side-by-side panels (SQLite, CSV, JSON, TOON)
-Each panel: Select file, Load, Search, Log, Table view
-Bottom: Comparison summary (format | file | time(s) | rows)
+def medir_ram():
+    processo = psutil.Process(os.getpid())
+    return processo.memory_info().rss  # RAM em bytes
 
-Requirements:
-    pip install ttkbootstrap pandas
-    optional: pip install toon_format (for TOON support)
-
-Run:
-    python multi_format_comparator.py
-"""
 
 
 class FormatPanel(ttk.LabelFrame):
@@ -111,6 +103,7 @@ class FormatPanel(ttk.LabelFrame):
     def _load_worker(self):
         path = self.selected_file
         self._append_log(f'Iniciando carregamento ({self.fmt_key})')
+        ram_antes = medir_ram()
         t0 = time.perf_counter()
         try:
             if self.fmt_key == 'sqlite':
@@ -128,15 +121,12 @@ class FormatPanel(ttk.LabelFrame):
                 with open(path, 'r', encoding='utf-8') as f:
                     linhas = f.readlines()
 
-                # Determina número de colunas pela primeira linha
-                colunas = ['col_' + str(i+1) for i in range(len(linhas[0].split('|')))]
+                # --- usar a primeira linha como cabeçalho ---
+                header = linhas[0].strip().split('|')
+                dados = [linha.strip().split('|') for linha in linhas[1:]]
 
-                parsed = []
-                for linha in linhas:
-                    partes = linha.strip().split('|')
-                    parsed.append(partes)
+                df = pd.DataFrame(dados, columns=header)
 
-                df = pd.DataFrame(parsed, columns=colunas)
 
             else:
                 raise RuntimeError('Formato não suportado')
@@ -153,11 +143,14 @@ class FormatPanel(ttk.LabelFrame):
         t1 = time.perf_counter()
         elapsed = round(t1 - t0, 4)
         rows = len(df)
+        ram_depois = medir_ram()
+        ram_usada = ram_depois - ram_antes
+        ram_mb = ram_usada / 1024 / 1024
         self.df = df
         self._append_log(f'Concluído em {elapsed}s — {rows} linhas')
         self.info_var.set(f'Arquivo: {os.path.basename(path)} | {rows} linhas')
         self._fill_table()
-        self.comparator.record(self.fmt_key, path, elapsed, rows)
+        self.comparator.record(self.fmt_key, path, elapsed, rows, ram_mb)
         # parar spinner quando terminar
         self.spinner.stop()
         self.spinner.place_forget()
@@ -260,7 +253,7 @@ class ComparatorPanel(ttk.LabelFrame):
         self._build_ui()
 
     def _build_ui(self):
-        cols = ('format', 'file', 'time_s', 'rows', 'size', 'speed', 'rank')
+        cols = ('format', 'file', 'time_s', 'rows', 'ram', 'size', 'speed', 'rank')
         self.table = ttk.Treeview(self, columns=cols, show='headings', height=6)
 
         headers = {
@@ -268,6 +261,7 @@ class ComparatorPanel(ttk.LabelFrame):
             'file': 'Arquivo',
             'time_s': 'Tempo (s)',
             'rows': 'Linhas',
+            'ram': 'RAM (MB)',
             'size': 'Tamanho',
             'speed': 'Linhas/s',
             'rank': 'Ranking'
@@ -283,9 +277,10 @@ class ComparatorPanel(ttk.LabelFrame):
 
         self.table.pack(fill=BOTH, expand=True)
 
-    def record(self, fmt_key, file, time_s, rows):
-        self.records[fmt_key] = (file, time_s, rows)
+    def record(self, fmt_key, file, time_s, rows, ram_mb):
+        self.records[fmt_key] = (file, time_s, rows, ram_mb)
         self._refresh()
+
 
     def _refresh(self):
         self.table.delete(*self.table.get_children())
@@ -307,7 +302,7 @@ class ComparatorPanel(ttk.LabelFrame):
                 self.table.insert('', 'end', values=(fmt, '', '', '', '', '', ''))
                 continue
 
-            file, t, rows = rec
+            file, t, rows, ram = rec
             filename = os.path.basename(file) if file else ''
 
             # tamanho do arquivo
@@ -329,7 +324,7 @@ class ComparatorPanel(ttk.LabelFrame):
             # ranking
             rnk = ranking.get(fmt, '')
 
-            row = (fmt, filename, t, rows, size_str, speed, rnk)
+            row = (fmt, filename, t, rows, f"{ram:.2f} MB", size_str, speed, rnk)
 
             # destaque suave
             tag = ''

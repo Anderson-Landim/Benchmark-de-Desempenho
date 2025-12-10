@@ -87,7 +87,9 @@ def exportar_todos(dados, pasta_saida, callback):
     callback(etapa_atual, etapas)
 
     toon_path = os.path.join(pasta_saida, "dados.toon")
+
     with open(toon_path, "w", encoding="utf-8") as f:
+        f.write("|".join(dados[0].keys()) + "\n")
         for linha in dados:
             f.write("|".join([str(v) for v in linha.values()]) + "\n")
     tamanhos["TOON"] = os.path.getsize(toon_path)
